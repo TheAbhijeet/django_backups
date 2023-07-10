@@ -1,30 +1,31 @@
-import subprocess
 import warnings
+from types import SimpleNamespace
 
 from django.conf import settings
-from django.db import connections, DEFAULT_DB_ALIAS, OperationalError, IntegrityError, transaction
+from django.db import (
+    DEFAULT_DB_ALIAS,
+    IntegrityError,
+    InternalError,
+    OperationalError,
+    connections,
+    transaction,
+)
 from django.utils.timezone import now
-import re
-
-DUMP_TABLES = """
-SELECT "name", "type", "sql"
-FROM "sqlite_master"
-WHERE "sql" NOT NULL AND "type" == 'table'
-ORDER BY "name"
-"""
 
 
 def get_db_connector():
     # Determine the database type
-    database_engine = settings.DATABASES[DEFAULT_DB_ALIAS]['ENGINE']
+    database_engine = settings.DATABASES[DEFAULT_DB_ALIAS]["ENGINE"]
 
     # Create a backup based on the database type
-    if 'sqlite3' in database_engine:
+    if "sqlite3" in database_engine:
         return SqliteConnector()
-    elif 'postgresql' in database_engine:
+    elif "postgresql" in database_engine:
         return PostgresConnector()
     else:
-        raise Exception(f"Database type '{database_engine}' is not supported for backup.")
+        raise Exception(
+            f"Database type '{database_engine}' is not supported for backup."
+        )
 
 
 class BaseDBConnector:
@@ -32,7 +33,7 @@ class BaseDBConnector:
         self.backup_root = settings.BACKUP_ROOT
         self.media_root = settings.MEDIA_ROOT
         self.connection = connections[DEFAULT_DB_ALIAS]
-        self.exclude_tables = ['django_migrations', 'django_session']
+        self.exclude_tables = ["backups_restore"]
         self.backup_path = self.get_backup_path()
 
     @staticmethod
@@ -40,91 +41,150 @@ class BaseDBConnector:
         # Get the relative file path by removing the MEDIA_ROOT prefix
         relative_file_path = str(absolute_file_path.relative_to(settings.MEDIA_ROOT))
         # Normalize the path separators
-        relative_file_path = relative_file_path.replace('\\', '/')
+        relative_file_path = relative_file_path.replace("\\", "/")
         return relative_file_path
 
     def create_backup(self):
-        raise NotImplementedError
+        if not self.connection.is_usable():
+            self.connection.connect()
+        with open(self.backup_path, "w") as f:
+            self._write_dump(f)
+        return self.get_relative_media_file_path(self.backup_path)
 
     def restore_backup(self, backup_file):
         raise NotImplementedError
 
     def get_backup_path(self):
-        timestamp = now().strftime('%d-%m-%Y-%H::%M')
-        backup_filename = f'backup_{timestamp}.sql'
+        timestamp = now().strftime("%d-%m-%Y-%H::%M")
+        backup_filename = f"backup_{timestamp}.sql"
         return self.backup_root / backup_filename
 
-
-class PostgresConnector(BaseDBConnector):
-    def __init__(self):
-        db = settings.DATABASES[DEFAULT_DB_ALIAS]
-        self.db_host = db['HOST']
-        self.db_port = db['PORT'] or '5432'
-        self.db_name = db['NAME']
-        self.db_user = db['USER']
-        self.db_password = db['PASSWORD']
-        super().__init__()
-
-    def create_backup(self):
-        extra_args = '--no-comments --data-only --inserts --no-owner'
-        exclude_table_string = ' '.join([f'--exclude-table={table}' for table in self.exclude_tables])
-
-        command = f'PGPASSWORD={self.db_password} pg_dump {extra_args} {exclude_table_string} -U {self.db_user} -h' \
-                  f' {self.db_host} -p {self.db_port} -F p {self.db_name} > {self.backup_path}'
-
-        # Execute the pg_dump command using subprocess
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
-
-        if process.returncode != 0:
-            # Handle any errors that occurred during the restore process
-            raise Exception(f'Error occurred during database restore:\n{stderr.decode()}')
-        return self.get_relative_media_file_path(self.backup_path)
-
-    def restore_backup(self, backup_file):
-        if not self.connection.is_usable():
-            self.connection.connect()
-        cursor = self.connection.cursor()
-
-        self.clean_sql(backup_file.path)
-
-        for line in backup_file.readlines():
+    @staticmethod
+    def run_sql(sql_file, cursor):
+        for line in sql_file.readlines():
             try:
                 with transaction.atomic():
                     cursor.execute(line.strip().decode("UTF-8"))
             except (OperationalError, IntegrityError) as err:
                 warnings.warn(f"Error in db restore: {err}")
 
+    def _write_dump(self, file_obj):
+        raise NotImplementedError
+
+    def is_excluded_table(self, table_name):
+        excluded_prefixes = ["django_", "auth_", "sqlite_"]
+        return (
+            table_name.startswith(tuple(excluded_prefixes))
+            or table_name in self.exclude_tables
+        )
+
+
+class PostgresConnector(BaseDBConnector):
+    def __init__(self):
+        db = settings.DATABASES[DEFAULT_DB_ALIAS]
+        self.db_host = db["HOST"]
+        self.db_port = db["PORT"] or "5432"
+        self.db_name = db["NAME"]
+        self.db_user = db["USER"]
+        self.db_password = db["PASSWORD"]
+        super().__init__()
+
     @staticmethod
-    def clean_sql(file_path):
-        # Read the file content
-        with open(file_path, 'r', encoding='utf-8') as file:
-            file_content = file.read()
+    def sql_queries() -> SimpleNamespace:
+        sql_queries = SimpleNamespace(
+            GET_TABLE_NAME="SELECT tablename FROM pg_tables WHERE schemaname='public'",
+            SELECT_TABLE="SELECT * FROM {table_name}",
+            INSERT_ROW="INSERT INTO {table_name} VALUES ({values});",
+            SET_SEQUENCE="SELECT setval('{sequence_name}', (SELECT MAX(id) FROM {table_name}));",
+            SELECT_TABLE_NAMES="SELECT tablename FROM pg_tables WHERE schemaname='public'",
+            TRUNCATE_TABLE="TRUNCATE TABLE {table_name} RESTART IDENTITY CASCADE",
+        )
+        return sql_queries
 
-        # Remove SQL comments starting with "--"
-        pattern = r'^\s*--.*?$'
-        modified_content = re.sub(pattern, '', file_content, flags=re.MULTILINE)
+    def _write_dump(self, file_obj):
+        cursor = self.connection.connection.cursor()
+        sql = self.sql_queries()
 
-        # Remove lines containing SET statements
-        pattern_set = r'^\s*SET\b.*?$'
-        modified_content = re.sub(pattern_set, '', modified_content, flags=re.MULTILINE)
+        # Get table names
+        cursor.execute(sql.GET_TABLE_NAME)
+        table_names = cursor.fetchall()
 
-        # Remove empty lines
-        pattern_empty_lines = r'^\s*\n'
-        modified_content = re.sub(pattern_empty_lines, '', modified_content, flags=re.MULTILINE)
+        # Write INSERT statements for each table
+        for table_name in table_names:
+            if self.is_excluded_table(table_name[0]):
+                continue
 
-        # Write the modified content back to the file
-        with open(file_path, 'w', encoding='utf-8') as file:
-            file.write(modified_content)
+            # INSERT statements
+            cursor.execute(sql.SELECT_TABLE.format(table_name=table_name[0]))
+            rows = cursor.fetchall()
+
+            for row in rows:
+                insert_query = sql.INSERT_ROW.format(
+                    table_name=table_name[0], values=",".join(["%s"] * len(row))
+                )
+                file_obj.write(cursor.mogrify(insert_query, row).decode() + "\n")
+
+            # Sequence updates
+            sequence_name = f"{table_name[0]}_id_seq"
+            sequence_query = sql.SET_SEQUENCE.format(
+                sequence_name=sequence_name, table_name=table_name[0]
+            )
+            file_obj.write(sequence_query + "\n")
+
+        cursor.close()
+
+    def restore_backup(self, backup_file):
+        if not self.connection.is_usable():
+            self.connection.connect()
+        cursor = self.connection.cursor()
+
+        sql = self.sql_queries()
+
+        cursor.execute(sql.SELECT_TABLE_NAMES)
+        table_names = [row[0] for row in cursor.fetchall()]
+
+        self.clear_tables(table_names, cursor)
+
+        self.run_sql(backup_file, cursor)
+
+    def clear_tables(self, table_names, cursor):
+        sql = self.sql_queries()
+        # Truncate tables
+        for table_name in table_names:
+            if self.is_excluded_table(table_name):
+                continue
+            try:
+                cursor.execute(sql.TRUNCATE_TABLE.format(table_name=table_name))
+            except (InternalError, OperationalError) as e:
+                warnings.warn(
+                    f"Ignoring error while truncating table {table_name}: {e}"
+                )
 
 
 class SqliteConnector(BaseDBConnector):
+    @staticmethod
+    def sql_queries() -> SimpleNamespace:
+        sql_queries = SimpleNamespace(
+            GET_TABLE_NAME="SELECT tablename FROM pg_tables WHERE schemaname='public'",
+            INSERT_ROW="""SELECT 'INSERT INTO "{0}" VALUES({1})' FROM "{0}";\n""",
+            TRUNCATE_TABLE="TRUNCATE TABLE {table_name} RESTART IDENTITY CASCADE",
+            DUMP_TABLES="""
+                   SELECT "name", "type", "sql"
+                   FROM "sqlite_master"
+                   WHERE "sql" NOT NULL AND "type" == 'table'
+                   ORDER BY "name"
+                   """,
+        )
+        return sql_queries
+
     def _write_dump(self, file_obj):
+        sql = self.sql_queries()
         cursor = self.connection.connection.cursor()
-        cursor.execute(DUMP_TABLES)
+        cursor.execute(sql.DUMP_TABLES)
         for table_name, _, sql in cursor.fetchall():
-            if table_name.startswith("sqlite_") or table_name in self.exclude_tables:
+            if self.is_excluded_table(table_name):
                 continue
+
             if sql.startswith("CREATE TABLE"):
                 sql = sql.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS")
                 # Make SQL commands in 1 line
@@ -134,8 +194,9 @@ class SqliteConnector(BaseDBConnector):
 
             table_name_ident = table_name.replace('"', '""')
             res = cursor.execute(f'PRAGMA table_info("{table_name_ident}")')
+
             column_names = [str(table_info[1]) for table_info in res.fetchall()]
-            q = """SELECT 'INSERT INTO "{0}" VALUES({1})' FROM "{0}";\n""".format(
+            q = sql.INSERT_ROW.format(
                 table_name_ident,
                 ",".join(
                     """'||quote("{}")||'""".format(col.replace('"', '""'))
@@ -147,20 +208,21 @@ class SqliteConnector(BaseDBConnector):
                 file_obj.write(f"{row[0]};\n".encode())
         cursor.close()
 
-    def create_backup(self):
-        if not self.connection.is_usable():
-            self.connection.connect()
-        with open(self.backup_path, "wb") as f:
-            self._write_dump(f)
-        return self.get_relative_media_file_path(self.backup_path)
-
     def restore_backup(self, backup_file):
         if not self.connection.is_usable():
             self.connection.connect()
         cursor = self.connection.cursor()
-        for line in backup_file.readlines():
-            try:
-                with transaction.atomic():
-                    cursor.execute(line.strip().decode("UTF-8"))
-            except (OperationalError, IntegrityError) as err:
-                warnings.warn(f"Error in db restore: {err}")
+
+        # Get the names of all tables except the session table
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        table_names = [row[0] for row in cursor.fetchall()]
+
+        self.clear_tables(table_names, cursor)
+
+        self.run_sql(backup_file, cursor)
+
+    def clear_tables(self, table_names, cursor):
+        for table_name in table_names:
+            if self.is_excluded_table(table_name):
+                continue
+            cursor.execute(f"DELETE FROM {table_name}")
